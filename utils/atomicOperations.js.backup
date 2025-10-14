@@ -1,0 +1,943 @@
+/**
+ * Atomic Database Operations Utility
+ * Ensures data consistency by using MongoDB transactions
+ * Provides comprehensive error handling and validation
+ */
+
+const mongoose = require('mongoose');
+const logger = require('../logger');
+const { validators } = require('./validation');
+const { ensureInventoryObject } = require('./inventory');
+
+/**
+ * Execute multiple database operations atomically
+ * @param {Array<Function>} operations - Array of async functions to execute
+ * @param {Object} session - MongoDB session (optional)
+ * @param {Object} options - Additional options
+ * @returns {Array} Results of all operations
+ */
+async function executeAtomic(operations, session = null, options = {}) {
+  const {
+    maxRetries = 3,
+    retryDelay = 1000,
+    timeout = 30000,
+    context = 'atomic_operation'
+  } = options;
+
+  if (!Array.isArray(operations) || operations.length === 0) {
+    throw new Error('executeAtomic: operations must be a non-empty array');
+  }
+
+  const shouldCreateSession = !session;
+  let attempt = 0;
+
+  while (attempt < maxRetries) {
+    try {
+      if (shouldCreateSession) {
+        session = await mongoose.startSession();
+      }
+
+      // Use withTransaction API for automatic retry handling
+      const transactionPromise = session.withTransaction(async () => {
+        const results = [];
+        for (let i = 0; i < operations.length; i++) {
+          const operation = operations[i];
+          if (typeof operation !== 'function') {
+            throw new Error(`executeAtomic: operation ${i} is not a function`);
+          }
+
+          const startTime = Date.now();
+          const result = await operation(session);
+          const duration = Date.now() - startTime;
+
+          if (duration > 5000) {
+            logger.warn(`Slow atomic operation detected: ${duration}ms in operation ${i}`);
+          }
+
+          results.push(result);
+        }
+        return results;
+      }, {
+        readConcern: { level: 'snapshot' },
+        writeConcern: { w: 'majority' },
+        readPreference: 'primary'
+      });
+
+      // Add timeout to prevent hanging
+      const results = await Promise.race([
+        transactionPromise,
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Transaction timeout')), timeout)
+        )
+      ]);
+
+      if (shouldCreateSession) {
+        await session.endSession();
+        logger.debug(`Atomic operation completed successfully: ${context}`);
+      }
+
+      return results;
+    } catch (error) {
+      attempt++;
+      
+      logger.error(`Atomic operation failed (attempt ${attempt}/${maxRetries}):`, {
+        error: error.message,
+        context,
+        attempt,
+        maxRetries
+      });
+
+      if (attempt >= maxRetries) {
+        throw new Error(`Atomic operation failed after ${maxRetries} attempts: ${error.message}`);
+      }
+
+      // Wait before retrying
+      await new Promise(resolve => setTimeout(resolve, retryDelay * attempt));
+    } finally {
+      if (shouldCreateSession && session) {
+        try {
+          await session.endSession();
+        } catch (endError) {
+          logger.error('Failed to end session:', endError);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Validate user ID and ensure user exists
+ * @param {string} userId - User ID to validate
+ * @param {Object} session - MongoDB session
+ * @returns {Object} User document
+ */
+async function validateAndGetUser(userId, session) {
+  if (!validators.userId(userId)) {
+    throw new Error(`Invalid user ID: ${userId}`);
+  }
+
+  const User = mongoose.model('User');
+  const user = await User.findById(userId).session(session);
+  
+  if (!user) {
+    throw new Error(`User not found: ${userId}`);
+  }
+
+  return user;
+}
+
+/**
+ * Atomic quest progress update with coin reward
+ * @param {string} userId - User ID
+ * @param {Array<string>} questNames - Array of quest names
+ * @param {number} coinReward - Coin reward amount
+ * @param {Object} interaction - Discord interaction (optional)
+ * @param {Object} options - Additional options
+ * @returns {Array} Results of operations
+ */
+async function atomicQuestUpdate(userId, questNames, coinReward, interaction = null, options = {}) {
+  if (!validators.userId(userId)) {
+    throw new Error(`Invalid user ID: ${userId}`);
+  }
+  if (!Array.isArray(questNames) || questNames.length === 0) {
+    throw new Error('questNames must be a non-empty array');
+  }
+  if (typeof coinReward !== 'number' || coinReward < 0) {
+    throw new Error('coinReward must be a non-negative number');
+  }
+
+  return executeAtomic([
+    // Validate and get user
+    async (session) => {
+      return await validateAndGetUser(userId, session);
+    },
+    // Update user coins
+    async (session) => {
+      const User = mongoose.model('User');
+      const result = await User.findByIdAndUpdate(
+        userId,
+        { $inc: { coins: coinReward } },
+        { session, new: true }
+      );
+      
+      if (!result) {
+        throw new Error(`Failed to update coins for user: ${userId}`);
+      }
+      
+      logger.info(`Updated coins for user ${userId}: +${coinReward}`);
+      return result;
+    }
+  ], null, { context: 'quest_update', ...options });
+}
+
+/**
+ * Atomic economy transaction (transfer between users)
+ * @param {string} fromUserId - Sender user ID
+ * @param {string} toUserId - Receiver user ID
+ * @param {number} amount - Transfer amount
+ * @param {string} reason - Transfer reason
+ * @param {Object} options - Additional options
+ * @returns {Array} Results of operations
+ */
+async function atomicEconomyTransfer(fromUserId, toUserId, amount, reason = '', options = {}) {
+  if (!validators.userId(fromUserId)) {
+    throw new Error(`Invalid sender user ID: ${fromUserId}`);
+  }
+  if (!validators.userId(toUserId)) {
+    throw new Error(`Invalid receiver user ID: ${toUserId}`);
+  }
+  if (fromUserId === toUserId) {
+    throw new Error('Cannot transfer to same user');
+  }
+  if (typeof amount !== 'number' || amount <= 0) {
+    throw new Error('amount must be a positive number');
+  }
+
+  return executeAtomic([
+    // Validate sender
+    async (session) => {
+      const sender = await validateAndGetUser(fromUserId, session);
+      if (sender.coins < amount) {
+        throw new Error(`Insufficient funds: ${sender.coins} < ${amount}`);
+      }
+      return sender;
+    },
+    // Validate receiver
+    async (session) => {
+      return await validateAndGetUser(toUserId, session);
+    },
+    // Deduct from sender
+    async (session) => {
+      const User = mongoose.model('User');
+      const result = await User.findByIdAndUpdate(
+        fromUserId,
+        { $inc: { coins: -amount } },
+        { session, new: true }
+      );
+      
+      if (!result) {
+        throw new Error(`Failed to deduct coins from sender: ${fromUserId}`);
+      }
+      
+      logger.info(`Deducted ${amount} coins from user ${fromUserId}`);
+      return result;
+    },
+    // Add to receiver
+    async (session) => {
+      const User = mongoose.model('User');
+      const result = await User.findByIdAndUpdate(
+        toUserId,
+        { $inc: { coins: amount } },
+        { session, new: true }
+      );
+      
+      if (!result) {
+        throw new Error(`Failed to add coins to receiver: ${toUserId}`);
+      }
+      
+      logger.info(`Added ${amount} coins to user ${toUserId}`);
+      return result;
+    },
+    // Log transfer
+    async (session) => {
+      logger.audit(fromUserId, 'economy_transfer', toUserId, `${amount} coins - ${reason}`);
+      return true;
+    }
+  ], null, { context: 'economy_transfer', ...options });
+}
+
+/**
+ * Atomic inventory operation
+ * @param {string} userId - User ID
+ * @param {string} itemName - Item name
+ * @param {number} amount - Amount to add/remove
+ * @param {string} operation - 'add' or 'remove'
+ * @param {Object} options - Additional options
+ * @returns {Array} Results of operations
+ */
+async function atomicInventoryOperation(userId, itemName, amount, operation = 'add', options = {}) {
+  if (!validators.userId(userId)) {
+    throw new Error(`Invalid user ID: ${userId}`);
+  }
+  if (!itemName || typeof itemName !== 'string') {
+    throw new Error('itemName must be a non-empty string');
+  }
+  if (typeof amount !== 'number' || amount <= 0) {
+    throw new Error('amount must be a positive number');
+  }
+  if (!['add', 'remove'].includes(operation)) {
+    throw new Error('operation must be "add" or "remove"');
+  }
+
+  // Defensive fix: auto-convert array inventory to object if needed
+  const User = mongoose.model('User');
+  let user = await User.findById(userId);
+  user = await ensureInventoryObject(user);
+  if (!user) throw new Error(`User not found: ${userId}`);
+  if (!user.inventory || typeof user.inventory !== 'object' || Array.isArray(user.inventory)) {
+    throw new Error(`User inventory is not an object for user ${userId}. Please fix the data.`);
+  }
+
+  return executeAtomic([
+    // Validate user
+    async (session) => {
+      return await validateAndGetUser(userId, session);
+    },
+    // Update inventory
+    async (session) => {
+      const update = operation === 'add' 
+        ? { $inc: { [`inventory.${itemName}`]: amount } }
+        : { $inc: { [`inventory.${itemName}`]: -amount } };
+      
+      const result = await User.findByIdAndUpdate(userId, update, { session, new: true });
+      
+      if (!result) {
+        throw new Error(`Failed to update inventory for user: ${userId}`);
+      }
+      
+      // Check for negative inventory
+      if (result.inventory[itemName] < 0) {
+        throw new Error(`Insufficient ${itemName}: ${result.inventory[itemName] + amount} < ${amount}`);
+      }
+      
+      logger.info(`${operation === 'add' ? 'Added' : 'Removed'} ${amount} ${itemName} for user ${userId}`);
+      return result;
+    }
+  ], null, { context: 'inventory_operation', ...options });
+}
+
+/**
+ * Atomic guild operation
+ * @param {string} guildId - Guild ID
+ * @param {string} operation - Operation type
+ * @param {Object} data - Operation data
+ * @param {Object} options - Additional options
+ * @returns {Array} Results of operations
+ */
+async function atomicGuildOperation(guildId, operation, data, options = {}) {
+  if (!guildId || typeof guildId !== 'string') {
+    throw new Error('guildId must be a non-empty string');
+  }
+  if (!operation || typeof operation !== 'string') {
+    throw new Error('operation must be a non-empty string');
+  }
+
+  const Guild = mongoose.model('Guild');
+  
+  return executeAtomic([
+    // Validate guild exists
+    async (session) => {
+      const guild = await Guild.findById(guildId).session(session);
+      if (!guild) {
+        throw new Error(`Guild not found: ${guildId}`);
+      }
+      return guild;
+    },
+    // Perform guild operation
+    async (session) => {
+      let update = {};
+      
+      switch (operation) {
+        case 'update_vault':
+          update = { $inc: { vault: data.amount } };
+          break;
+        case 'update_level':
+          update = { $inc: { level: data.amount } };
+          break;
+        case 'update_xp':
+          update = { $inc: { xp: data.amount } };
+          break;
+        case 'update_members':
+          if (data.add) {
+            update = { $addToSet: { members: data.userId } };
+          } else if (data.remove) {
+            update = { $pull: { members: data.userId } };
+          }
+          break;
+        case 'update_officers':
+          if (data.add) {
+            update = { $addToSet: { officers: data.userId } };
+          } else if (data.remove) {
+            update = { $pull: { officers: data.userId } };
+          }
+          break;
+        default:
+          throw new Error(`Unknown guild operation: ${operation}`);
+      }
+      
+      const result = await Guild.findByIdAndUpdate(guildId, update, { session, new: true });
+      
+      if (!result) {
+        throw new Error(`Failed to perform guild operation: ${operation}`);
+      }
+      
+      logger.info(`Guild operation completed: ${operation} for guild ${guildId}`);
+      return result;
+    }
+  ], null, { context: 'guild_operation', ...options });
+}
+
+/**
+ * Atomic fishing operation
+ * @param {string} userId - User ID
+ * @param {Object} fishData - Fishing data to update
+ * @param {Object} rewards - Rewards to grant
+ * @param {Object} options - Additional options
+ * @returns {Array} Results of operations
+ */
+async function atomicFishingOperation(userId, fishData, rewards, options = {}) {
+  if (!validators.userId(userId)) {
+    throw new Error(`Invalid user ID: ${userId}`);
+  }
+
+  return executeAtomic([
+    // Validate user
+    async (session) => {
+      return await validateAndGetUser(userId, session);
+    },
+    // Update fishing data and grant rewards
+    async (session) => {
+      const User = mongoose.model('User');
+      const update = {
+        $set: fishData,
+        $inc: { coins: rewards.coins || 0 }
+      };
+      
+      const result = await User.findByIdAndUpdate(userId, update, { session, new: true });
+      
+      if (!result) {
+        throw new Error(`Failed to update fishing data for user: ${userId}`);
+      }
+      
+      logger.info(`Fishing operation completed for user ${userId}: +${rewards.coins || 0} coins`);
+      return result;
+    }
+  ], null, { context: 'fishing_operation', ...options });
+}
+
+/**
+ * Atomic farm operation
+ * @param {string} userId - User ID
+ * @param {Object} farmData - Farm data to update
+ * @param {Object} harvestData - Harvest data
+ * @param {Object} options - Additional options
+ * @returns {Array} Results of operations
+ */
+async function atomicFarmOperation(userId, farmData, harvestData, options = {}) {
+  if (!validators.userId(userId)) {
+    throw new Error(`Invalid user ID: ${userId}`);
+  }
+
+  return executeAtomic([
+    // Validate user
+    async (session) => {
+      return await validateAndGetUser(userId, session);
+    },
+    // Update farm data and grant harvest rewards
+    async (session) => {
+      const User = mongoose.model('User');
+      const update = {
+        $set: farmData,
+        $inc: { 
+          coins: harvestData.coins || 0,
+          xp: harvestData.xp || 0
+        }
+      };
+      
+      const result = await User.findByIdAndUpdate(userId, update, { session, new: true });
+      
+      if (!result) {
+        throw new Error(`Failed to update farm data for user: ${userId}`);
+      }
+      
+      logger.info(`Farm operation completed for user ${userId}: +${harvestData.coins || 0} coins, +${harvestData.xp || 0} xp`);
+      return result;
+    }
+  ], null, { context: 'farm_operation', ...options });
+}
+
+/**
+ * Atomic gambling operation
+ * @param {string} userId - User ID
+ * @param {number} betAmount - Amount bet
+ * @param {number} winAmount - Amount won (can be negative for losses)
+ * @param {string} gameType - Type of game
+ * @param {Object} options - Additional options
+ * @returns {Array} Results of operations
+ */
+async function atomicGamblingOperation(userId, betAmount, winAmount, gameType, options = {}) {
+  if (!validators.userId(userId)) {
+    throw new Error(`Invalid user ID: ${userId}`);
+  }
+  if (typeof betAmount !== 'number' || betAmount <= 0) {
+    throw new Error('betAmount must be a positive number');
+  }
+  if (typeof winAmount !== 'number') {
+    throw new Error('winAmount must be a number');
+  }
+  if (!gameType || typeof gameType !== 'string') {
+    throw new Error('gameType must be a non-empty string');
+  }
+
+  return executeAtomic([
+    // Validate user has sufficient funds
+    async (session) => {
+      const user = await validateAndGetUser(userId, session);
+      if (user.coins < betAmount) {
+        throw new Error(`Insufficient funds for gambling: ${user.coins} < ${betAmount}`);
+      }
+      return user;
+    },
+    // Update coins (bet is already deducted, just add winnings)
+    async (session) => {
+      const User = mongoose.model('User');
+      const result = await User.findByIdAndUpdate(
+        userId,
+        { $inc: { coins: winAmount } },
+        { session, new: true }
+      );
+      
+      if (!result) {
+        throw new Error(`Failed to update coins for gambling: ${userId}`);
+      }
+      
+      const outcome = winAmount >= 0 ? 'won' : 'lost';
+      logger.info(`Gambling ${outcome}: user ${userId} ${gameType} - ${outcome} ${Math.abs(winAmount)} coins`);
+      return result;
+    },
+    // Log gambling activity
+    async (session) => {
+      logger.audit(userId, 'gambling', null, `${gameType}: bet ${betAmount}, ${winAmount >= 0 ? 'won' : 'lost'} ${Math.abs(winAmount)}`);
+      return true;
+    }
+  ], null, { context: 'gambling_operation', ...options });
+}
+
+/**
+ * Atomic shop purchase
+ * @param {string} userId - User ID
+ * @param {string} itemName - Item name
+ * @param {number} price - Item price
+ * @param {Object} itemData - Item data to add
+ * @param {Object} options - Additional options
+ * @returns {Array} Results of operations
+ */
+async function atomicShopPurchase(userId, itemName, price, itemData, options = {}) {
+  if (!validators.userId(userId)) {
+    throw new Error(`Invalid user ID: ${userId}`);
+  }
+  if (!itemName || typeof itemName !== 'string') {
+    throw new Error('itemName must be a non-empty string');
+  }
+  if (typeof price !== 'number' || price <= 0) {
+    throw new Error('price must be a positive number');
+  }
+
+  return executeAtomic([
+    // Validate user has sufficient funds
+    async (session) => {
+      const user = await validateAndGetUser(userId, session);
+      if (user.coins < price) {
+        throw new Error(`Insufficient funds for purchase: ${user.coins} < ${price}`);
+      }
+      return user;
+    },
+    // Deduct coins and add item
+    async (session) => {
+      const User = mongoose.model('User');
+      const update = {
+        $inc: { coins: -price },
+        $set: itemData
+      };
+      
+      const result = await User.findByIdAndUpdate(userId, update, { session, new: true });
+      
+      if (!result) {
+        throw new Error(`Failed to process shop purchase: ${userId}`);
+      }
+      
+      logger.info(`Shop purchase completed: user ${userId} bought ${itemName} for ${price} coins`);
+      return result;
+    },
+    // Log purchase
+    async (session) => {
+      logger.audit(userId, 'shop_purchase', null, `${itemName} for ${price} coins`);
+      return true;
+    }
+  ], null, { context: 'shop_purchase', ...options });
+}
+
+// Guild-specific atomic operations
+async function atomicGuildCreation(userId, guildData, userData) {
+  const session = await mongoose.startSession();
+  
+  try {
+    const transactionPromise = session.withTransaction(async () => {
+      const Guild = mongoose.model('Guild');
+      const User = mongoose.model('User');
+      
+      // Create guild
+      const guild = new Guild(guildData);
+      await guild.save({ session });
+      
+      // Update user
+      await User.findByIdAndUpdate(userId, userData, { session });
+      
+      return guild;
+    }, {
+      readConcern: { level: 'snapshot' },
+      writeConcern: { w: 'majority' },
+      readPreference: 'primary'
+    });
+    
+    // Add timeout to prevent hanging
+    const guild = await Promise.race([
+      transactionPromise,
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Transaction timeout')), 10000)
+      )
+    ]);
+    
+    await session.endSession();
+    return guild;
+  } catch (error) {
+    await session.endSession();
+    throw error;
+  }
+}
+
+/**
+ * Atomic guild join via invite code
+ */
+async function atomicGuildJoin(userId, guildId, userData, inviteCode) {
+  let session = null;
+  try {
+    session = await mongoose.startSession();
+    const Guild = mongoose.model('Guild');
+    const User = mongoose.model('User');
+    const transactionPromise = session.withTransaction(async () => {
+      // Increment invite uses
+      await Guild.updateOne(
+        { _id: guildId, 'invites.code': inviteCode },
+        { $inc: { 'invites.$.uses': 1 } },
+        { session }
+      );
+      // Add user to guild
+      await Guild.findByIdAndUpdate(guildId, { $push: { members: userId } }, { session });
+      // Remove Guild Ticket from user
+      await User.findByIdAndUpdate(userId, { $pull: { inventory: { name: 'Guild Ticket' } } }, { session });
+      // Update user with guild info
+      await User.findByIdAndUpdate(userId, { $set: userData }, { session });
+    }, {
+      readPreference: 'primary',
+      readConcern: { level: 'local' },
+      writeConcern: { w: 'majority' }
+    });
+    await Promise.race([
+      transactionPromise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Transaction timeout')), 10000))
+    ]);
+  } catch (error) {
+    logger.error('Atomic guild join failed:', error);
+    throw error;
+  } finally {
+    if (session) await session.endSession();
+  }
+}
+
+/**
+ * Atomic guild member acceptance (application)
+ */
+async function atomicGuildMemberAcceptance(guildId, targetUserId, reviewerId) {
+  let session = null;
+  try {
+    session = await mongoose.startSession();
+    const Guild = mongoose.model('Guild');
+    const User = mongoose.model('User');
+    const transactionPromise = session.withTransaction(async () => {
+      // Update application status
+      await Guild.updateOne(
+        { _id: guildId, 'applications.userId': targetUserId },
+        {
+          $set: {
+            'applications.$.status': 'ACCEPTED',
+            'applications.$.reviewedBy': reviewerId,
+            'applications.$.reviewedAt': new Date()
+          }
+        },
+        { session }
+      );
+      // Add user to guild
+      await Guild.findByIdAndUpdate(guildId, { $push: { members: targetUserId } }, { session });
+      // Remove Guild Ticket from user
+      await User.findByIdAndUpdate(targetUserId, { $pull: { inventory: { name: 'Guild Ticket' } } }, { session });
+      // Update user with guild info
+      await User.findByIdAndUpdate(targetUserId, { $set: { guildId: guildId, guildRole: 'member' } }, { session });
+    }, {
+      readPreference: 'primary',
+      readConcern: { level: 'local' },
+      writeConcern: { w: 'majority' }
+    });
+    await Promise.race([
+      transactionPromise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Transaction timeout')), 10000))
+    ]);
+  } catch (error) {
+    logger.error('Atomic guild member acceptance failed:', error);
+    throw error;
+  } finally {
+    if (session) await session.endSession();
+  }
+}
+
+async function atomicGuildLeave(userId, guildId) {
+  let session = null;
+  
+  try {
+    session = await mongoose.startSession();
+    
+    // Use withTransaction API for automatic retry handling
+    const transactionPromise = session.withTransaction(async () => {
+      const Guild = mongoose.model('Guild');
+      const User = mongoose.model('User');
+      
+      // Remove user from guild
+      await Guild.findByIdAndUpdate(guildId, {
+        $pull: { 
+          members: userId,
+          officers: userId 
+        }
+      }, { session });
+      
+      // Update user
+      await User.findByIdAndUpdate(userId, {
+        $unset: { guildId: 1, guildRole: 1 }
+      }, { session });
+    }, {
+      readPreference: 'primary',
+      readConcern: { level: 'local' },
+      writeConcern: { w: 'majority' }
+    });
+
+    // Add timeout to prevent hanging transactions
+    await Promise.race([
+      transactionPromise,
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Transaction timeout')), 10000)
+      )
+    ]);
+  } catch (error) {
+    logger.error('Atomic guild leave failed:', error);
+    throw error;
+  } finally {
+    if (session) {
+      await session.endSession();
+    }
+  }
+}
+
+async function atomicGuildMemberUpdate(guildId, userId, updates) {
+  const session = await mongoose.startSession();
+  
+  try {
+    const transactionPromise = session.withTransaction(async () => {
+      const Guild = mongoose.model('Guild');
+      
+      // Update guild member arrays
+      if (updates.removeFromMembers) {
+        await Guild.findByIdAndUpdate(guildId, {
+          $pull: { members: userId }
+        }, { session });
+      }
+      
+      if (updates.removeFromOfficers) {
+        await Guild.findByIdAndUpdate(guildId, {
+          $pull: { officers: userId }
+        }, { session });
+      }
+      
+      if (updates.addToMembers) {
+        await Guild.findByIdAndUpdate(guildId, {
+          $push: { members: userId }
+        }, { session });
+      }
+      
+      if (updates.addToOfficers) {
+        await Guild.findByIdAndUpdate(guildId, {
+          $push: { officers: userId }
+        }, { session });
+      }
+      
+      if (updates.newOwner) {
+        await Guild.findByIdAndUpdate(guildId, {
+          $set: { owner: updates.newOwner }
+        }, { session });
+      }
+    }, {
+      readConcern: { level: 'snapshot' },
+      writeConcern: { w: 'majority' },
+      readPreference: 'primary'
+    });
+    
+    // Add timeout to prevent hanging
+    await Promise.race([
+      transactionPromise,
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Transaction timeout')), 10000)
+      )
+    ]);
+    
+    await session.endSession();
+  } catch (error) {
+    await session.endSession();
+    throw error;
+  }
+}
+
+async function atomicGuildVaultUpdate(guildId, userId, vaultChange, userChange) {
+  let session = null;
+  
+  try {
+    session = await mongoose.startSession();
+    
+    // Use withTransaction API for automatic retry handling
+    const transactionPromise = session.withTransaction(async () => {
+      const Guild = mongoose.model('Guild');
+      const User = mongoose.model('User');
+      
+      // Update guild vault
+      if (vaultChange) {
+        await Guild.findByIdAndUpdate(guildId, {
+          $inc: { vault: vaultChange }
+        }, { session });
+      }
+      
+      // Update user coins
+      if (userChange) {
+        await User.findByIdAndUpdate(userId, {
+          $inc: { coins: userChange }
+        }, { session });
+      }
+    }, {
+      readPreference: 'primary',
+      readConcern: { level: 'local' },
+      writeConcern: { w: 'majority' }
+    });
+
+    // Add timeout to prevent hanging transactions
+    await Promise.race([
+      transactionPromise,
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Transaction timeout')), 10000)
+      )
+    ]);
+  } catch (error) {
+    logger.error('Atomic guild vault update failed:', error);
+    throw error;
+  } finally {
+    if (session) {
+      await session.endSession();
+    }
+  }
+}
+
+/**
+ * Atomic guild vault operation (deposit/withdraw)
+ */
+async function atomicGuildVaultOperation(guildId, userId, amount, operation, timeout = 10000) {
+  let session = null;
+  
+  try {
+    session = await mongoose.startSession();
+    
+    // Use withTransaction API for automatic retry handling
+    const transactionPromise = session.withTransaction(async () => {
+      const Guild = mongoose.model('Guild');
+      const User = mongoose.model('User');
+      
+      if (operation === 'deposit') {
+        // Deduct from user, add to guild vault
+        const userResult = await User.findByIdAndUpdate(
+          userId, 
+          { $inc: { coins: -amount } },
+          { session, new: true }
+        );
+        
+        if (!userResult || userResult.coins < 0) {
+          throw new Error('Insufficient user balance for deposit');
+        }
+        
+        const guildResult = await Guild.findByIdAndUpdate(
+          guildId,
+          { $inc: { vault: amount, 'statistics.totalEarnings': amount } },
+          { session, new: true }
+        );
+        
+        return { user: userResult, guild: guildResult };
+        
+      } else if (operation === 'withdraw') {
+        // Deduct from guild vault, add to user
+        const guildResult = await Guild.findByIdAndUpdate(
+          guildId,
+          { $inc: { vault: -amount } },
+          { session, new: true }
+        );
+        
+        if (!guildResult || guildResult.vault < 0) {
+          throw new Error('Insufficient guild vault balance for withdrawal');
+        }
+        
+        const userResult = await User.findByIdAndUpdate(
+          userId,
+          { $inc: { coins: amount } },
+          { session, new: true }
+        );
+        
+        return { user: userResult, guild: guildResult };
+      }
+      
+      throw new Error('Invalid vault operation');
+    }, {
+      readPreference: 'primary',
+      readConcern: { level: 'local' },
+      writeConcern: { w: 'majority' }
+    });
+
+    // Add timeout to prevent hanging transactions
+    const result = await Promise.race([
+      transactionPromise,
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Transaction timeout')), timeout)
+      )
+    ]);
+
+    return result;
+  } catch (error) {
+    logger.error('Atomic guild vault operation failed:', error);
+    throw error;
+  } finally {
+    if (session) {
+      await session.endSession();
+    }
+  }
+}
+
+module.exports = {
+  executeAtomic,
+  validateAndGetUser,
+  atomicQuestUpdate,
+  atomicEconomyTransfer,
+  atomicInventoryOperation,
+  atomicGuildOperation,
+  atomicFishingOperation,
+  atomicFarmOperation,
+  atomicGamblingOperation,
+  atomicShopPurchase,
+  atomicGuildCreation,
+  atomicGuildJoin,
+  atomicGuildLeave,
+  atomicGuildMemberUpdate,
+  atomicGuildVaultUpdate,
+  atomicGuildVaultOperation,
+  atomicGuildMemberAcceptance
+}; 
