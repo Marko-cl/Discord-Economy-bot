@@ -1,4 +1,4 @@
-# Discord-Economy-bot
+# Discord-Economy-bot (MADE WITH THE HELP OF AI)
 Project
 # Kelonomy Discord Bot (discord.js)
 
